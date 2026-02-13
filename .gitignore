@@ -1,0 +1,45 @@
+# ── Working / data folders (contents ignored, folders kept) ──
+/History/*
+!/History/.gitkeep
+
+# Inspection files live inside Core_software
+/Core_software/Inspection_files/*
+!/Core_software/Inspection_files/.gitkeep
+
+# First-run dependency marker
+.deps_installed
+
+*.inspect_*.txt
+
+# Workspace locks / multi-instance workspaces
+/.dustybot.lock
+/workspaces/
+
+serials.txt
+Serial.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.log
+*.sqlite3
+.venv/
+venv/
+ENV/
+env/
