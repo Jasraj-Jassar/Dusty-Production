@@ -5,6 +5,8 @@
 # Inspection files live inside Core_software
 /Core_software/Inspection_files/*
 !/Core_software/Inspection_files/.gitkeep
+!/Core_software/Inspection_files/mech_inspect_sheet.pdf
+!/Core_software/Inspection_files/weld_inspect_sheet.pdf
 
 # First-run dependency marker
 .deps_installed

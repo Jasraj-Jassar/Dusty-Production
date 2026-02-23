@@ -1,9 +1,11 @@
 import argparse
+import contextlib
 import csv
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -59,7 +61,7 @@ def find_sumatra(explicit_path: str | None) -> str | None:
 
 
 def load_rev_manifest(ops_root: Path) -> dict[str, list[str]]:
-    """Return asm_key -> list of drawing dest paths (as strings)."""
+    """Return asm_key -> list of drawing dest paths (as strings), excluding PowderCoat PC rows."""
     rev_path = ops_root / "rev_pull_manifest.csv"
     if not rev_path.is_file():
         return {}
@@ -71,15 +73,55 @@ def load_rev_manifest(ops_root: Path) -> dict[str, list[str]]:
                 asm_raw = (row.get("asm") or "").strip().strip('"')
                 dest_raw = (row.get("dest_path") or "").strip().strip('"')
                 status = (row.get("status") or "").strip().upper()
+                subgroup = (row.get("subgroup") or "").strip().lower()
+                part = (row.get("part") or "").strip().lower()
+                base = (row.get("base") or "").strip().lower()
                 if not asm_raw or not dest_raw:
                     continue
                 if status != "COPIED" and status != "ALREADY_EXISTS":
+                    continue
+                if subgroup == "powdercoat" and ("(pc)" in part or base.endswith("-pc")):
+                    # Powder coat PC files are printed with Welding set (handled separately).
                     continue
                 key = ",".join([s.strip() for s in asm_raw.split(",") if s.strip()])
                 out.setdefault(key, []).append(dest_raw)
     except Exception:
         return {}
     return out
+
+
+def load_powdercoat_paths(ops_root: Path) -> list[str]:
+    rev_path = ops_root / "rev_pull_manifest.csv"
+    if not rev_path.is_file():
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        with rev_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                subgroup = (row.get("subgroup") or "").strip().lower()
+                status = (row.get("status") or "").strip().upper()
+                dest_raw = (row.get("dest_path") or "").strip().strip('"')
+                part = (row.get("part") or "").strip().lower()
+                base = (row.get("base") or "").strip().lower()
+                if subgroup != "powdercoat":
+                    continue
+                if status not in {"COPIED", "ALREADY_EXISTS"}:
+                    continue
+                if "(pc)" not in part and not base.endswith("-pc"):
+                    continue
+                if not dest_raw:
+                    continue
+                if dest_raw in seen:
+                    continue
+                seen.add(dest_raw)
+                out.append(dest_raw)
+    except Exception:
+        return []
+
+    return sorted(out, key=str.lower)
 
 
 def load_group_manifest(ops_root: Path) -> dict[str, str]:
@@ -128,16 +170,33 @@ def find_by_name(root: Path, filename: str) -> Path | None:
 
 def resolve_drawings(ops_root: Path, paths: list[str]) -> list[Path]:
     out: list[Path] = []
+    seen: set[str] = set()
     for raw in paths:
         p = Path(raw)
+        resolved: Path | None = None
         if p.is_file():
-            out.append(p)
+            resolved = p
+        else:
+            # Fallback: search by filename within ops_root
+            resolved = find_by_name(ops_root, p.name)
+        if resolved is None:
             continue
-        # Fallback: search by filename within ops_root
-        found = find_by_name(ops_root, p.name)
-        if found is not None:
-            out.append(found)
+        try:
+            key = os.path.normcase(str(resolved.resolve()))
+        except Exception:
+            key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
     return out
+
+
+def find_ops_parts_cover(ops_root: Path, bucket: str) -> Path | None:
+    if not bucket:
+        return None
+    p = ops_root / "ops_parts_sections_pdf" / f"{bucket}_ops_parts.pdf"
+    return p if p.is_file() else None
 
 
 def print_pdf(sumatra: str, printer: str, settings: str, pdf: Path) -> int:
@@ -154,9 +213,23 @@ def print_pdf(sumatra: str, printer: str, settings: str, pdf: Path) -> int:
     return completed.returncode
 
 
+def hard_rotate_pdf(src_pdf: Path, out_pdf: Path, degrees: int = 180) -> None:
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(src_pdf))
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.rotate(degrees)
+        writer.add_page(page)
+
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    with out_pdf.open("wb") as f:
+        writer.write(f)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Print ops_grouped Asm PDFs (letter landscape) followed by linked drawings (tabloid)."
+        description="Print ops_grouped Asm PDFs (with optional ops summary cover per bucket) followed by linked drawings (tabloid). PowderCoat files print at the start of the Welding set."
     )
     parser.add_argument(
         "--ops-root",
@@ -182,7 +255,7 @@ def main() -> int:
         "--sleep",
         type=float,
         default=DEFAULT_SLEEP_SECONDS,
-        help="Seconds to wait between print jobs (default: 1.5)",
+        help=f"Seconds to wait between print jobs (default: {DEFAULT_SLEEP_SECONDS})",
     )
     parser.add_argument(
         "--dry-run",
@@ -193,6 +266,15 @@ def main() -> int:
         "--only",
         default="",
         help="Only print a single bucket: Assembly, Machining, or Welding (default: all)",
+    )
+    parser.add_argument(
+        "--hard-rotate-drawings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Create temporary hard-rotated (180 deg) copies for tabloid drawing prints only. "
+            "No files are modified in ops_grouped (default: on)."
+        ),
     )
 
     args = parser.parse_args()
@@ -216,10 +298,24 @@ def main() -> int:
     if only_bucket:
         only_bucket = only_bucket.title()
 
-    def asm_bucket_key(p: Path):
+    rotate_drawings = bool(args.hard_rotate_drawings)
+    if rotate_drawings:
+        try:
+            import pypdf  # noqa: F401
+        except Exception:
+            print("Error: pypdf is required for --hard-rotate-drawings.")
+            print("Install with: python -m pip install -r requirements.txt")
+            return 2
+
+    def asm_bucket_name(p: Path) -> str:
         bucket, subgroup = manifest_info.get(p.name, ("", ""))
         if not bucket:
             bucket = bucket_from_path(p, ops_root)
+        return bucket
+
+    def asm_bucket_key(p: Path):
+        bucket = asm_bucket_name(p)
+        _, subgroup = manifest_info.get(p.name, ("", ""))
         return (bucket_order.get(bucket, 3), bucket, subgroup, asm_sort_key(p.name))
 
     asm_pdfs.sort(key=asm_bucket_key)
@@ -234,48 +330,116 @@ def main() -> int:
         return 0
 
     rev_map = load_rev_manifest(ops_root)
+    powdercoat_drawings = resolve_drawings(ops_root, load_powdercoat_paths(ops_root))
 
     # Sumatra settings
     asm_settings = "fit,paper=letter,duplex=off"
-    draw_settings = "fit,paper=tabloid,duplex=off,rotation=180"
+    # Drawings are printed in tabloid without the previous 180-degree flip
+    # so the sheet orientation faces the operator at pickup.
+    draw_settings = "fit,paper=tabloid,duplex=off,rotation=0"
 
     print(f"SumatraPDF: {sumatra}")
     print(f"Asm printer: {args.asm_printer}  settings: {asm_settings}")
     print(f"Drawing printer: {args.drawing_printer}  settings: {draw_settings}")
+    print(f"Hard rotate drawings: {'on' if rotate_drawings else 'off'}")
     print(f"Asm count: {len(asm_pdfs)}")
 
     failures = 0
+    printed_bucket_covers: set[str] = set()
+    rotate_ctx = (
+        tempfile.TemporaryDirectory(prefix="dustybot_print_rotate_")
+        if rotate_drawings
+        else contextlib.nullcontext(None)
+    )
+    with rotate_ctx as rotate_dir_raw:
+        rotate_dir = Path(rotate_dir_raw) if rotate_dir_raw else None
+        rotated_cache: dict[Path, Path] = {}
 
-    for asm_pdf in asm_pdfs:
-        asm_key = asm_key_from_filename(asm_pdf)
-        print(f"\nAsm: {asm_pdf}")
+        def drawing_for_print(src: Path) -> Path:
+            if not rotate_drawings or rotate_dir is None:
+                return src
+            key = src.resolve()
+            cached = rotated_cache.get(key)
+            if cached and cached.is_file():
+                return cached
+            out_pdf = rotate_dir / f"{src.stem}__hardrot180_{len(rotated_cache) + 1}.pdf"
+            hard_rotate_pdf(src, out_pdf, degrees=180)
+            rotated_cache[key] = out_pdf
+            return out_pdf
 
-        if args.dry_run:
-            print(f"[DRY] Asm -> {asm_pdf}")
-        else:
-            rc = print_pdf(sumatra, args.asm_printer, asm_settings, asm_pdf)
-            if rc != 0:
-                failures += 1
-                print(f"Failed Asm: {asm_pdf} (exit {rc})")
-            time.sleep(args.sleep)
+        for asm_pdf in asm_pdfs:
+            asm_key = asm_key_from_filename(asm_pdf)
+            bucket = asm_bucket_name(asm_pdf)
 
-        drawings: list[Path] = []
-        if asm_key:
-            drawings = resolve_drawings(ops_root, rev_map.get(asm_key, []))
+            if bucket and bucket not in printed_bucket_covers:
+                cover_pdf = find_ops_parts_cover(ops_root, bucket)
+                if cover_pdf is not None:
+                    print(f"\nOps Summary ({bucket}): {cover_pdf}")
+                    if args.dry_run:
+                        print(f"[DRY] Ops Summary -> {cover_pdf}")
+                    else:
+                        rc = print_pdf(sumatra, args.asm_printer, asm_settings, cover_pdf)
+                        if rc != 0:
+                            failures += 1
+                            print(f"Failed Ops Summary: {cover_pdf} (exit {rc})")
+                        time.sleep(args.sleep)
 
-        if not drawings:
-            continue
+                    if bucket == "Welding" and powdercoat_drawings:
+                        print("PowderCoat files (Welding set):")
+                        for pc_pdf in powdercoat_drawings:
+                            if args.dry_run:
+                                note = " [hard-rotated temp]" if rotate_drawings else ""
+                                print(f"[DRY] PowderCoat -> {pc_pdf}{note}")
+                                continue
+                            print(f"PowderCoat: {pc_pdf}")
+                            try:
+                                printable_pc = drawing_for_print(pc_pdf)
+                            except Exception as e:
+                                failures += 1
+                                print(f"Failed PowderCoat hard-rotate: {pc_pdf} ({e})")
+                                continue
+                            rc = print_pdf(sumatra, args.drawing_printer, draw_settings, printable_pc)
+                            if rc != 0:
+                                failures += 1
+                                print(f"Failed PowderCoat: {pc_pdf} (exit {rc})")
+                            time.sleep(args.sleep)
+                printed_bucket_covers.add(bucket)
 
-        for dp in drawings:
+            print(f"\nAsm: {asm_pdf}")
+
             if args.dry_run:
-                print(f"[DRY] Drawing -> {dp}")
+                print(f"[DRY] Asm -> {asm_pdf}")
+            else:
+                rc = print_pdf(sumatra, args.asm_printer, asm_settings, asm_pdf)
+                if rc != 0:
+                    failures += 1
+                    print(f"Failed Asm: {asm_pdf} (exit {rc})")
+                time.sleep(args.sleep)
+
+            drawings: list[Path] = []
+            if asm_key:
+                drawings = resolve_drawings(ops_root, rev_map.get(asm_key, []))
+
+            if not drawings:
                 continue
-            print(f"Drawing: {dp}")
-            rc = print_pdf(sumatra, args.drawing_printer, draw_settings, dp)
-            if rc != 0:
-                failures += 1
-                print(f"Failed Drawing: {dp} (exit {rc})")
-            time.sleep(args.sleep)
+
+            for dp in drawings:
+                if args.dry_run:
+                    note = " [hard-rotated temp]" if rotate_drawings else ""
+                    print(f"[DRY] Drawing -> {dp}{note}")
+                    continue
+                print(f"Drawing: {dp}")
+                try:
+                    printable = drawing_for_print(dp)
+                except Exception as e:
+                    failures += 1
+                    print(f"Failed Drawing hard-rotate: {dp} ({e})")
+                    continue
+                rc = print_pdf(sumatra, args.drawing_printer, draw_settings, printable)
+                if rc != 0:
+                    failures += 1
+                    print(f"Failed Drawing: {dp} (exit {rc})")
+                time.sleep(args.sleep)
 
     if failures:
         print(f"\nDone with {failures} failure(s).")

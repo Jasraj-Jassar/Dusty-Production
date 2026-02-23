@@ -16,7 +16,7 @@ PAGE_RE = re.compile(
 
 @dataclass(frozen=True)
 class AsmLoc:
-    section: str  # e.g. "Machining" or "Welding/PowderCoat"
+    section: str  # e.g. "Machining" or "Assembly/PowderCoat"
     bucket: str
     subgroup: str
 
@@ -35,7 +35,7 @@ def load_asm_locations(manifest_csv: Path) -> dict[str, AsmLoc]:
 
             section = ""
             if dest:
-                # dest includes filename, e.g. "Welding/PowderCoat/Asm_1.pdf"
+                # dest includes filename, e.g. "Assembly/PowderCoat/Asm_1.pdf"
                 section = str(Path(dest).parent).replace("\\", "/")
             elif bucket and subgroup:
                 section = f"{bucket}/{subgroup}"

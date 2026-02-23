@@ -18,6 +18,7 @@ ASM_FILE_RE = re.compile(r"^Asm_(?P<asm>\d+)\.pdf$", re.IGNORECASE)
 # Treat numeric trailing "-<rev>" as a revision for numeric dash parts like "10-0845-2".
 # Avoid misclassifying non-numeric parts like "LC500WC-100" (not all segments numeric).
 NUMERIC_PART_WITH_REV_RE = re.compile(r"^(?P<base>\d{2,}(?:-\d{2,})+)-(?P<rev>\d{1,3})$")
+PC_WITH_REV_RE = re.compile(r"^(?P<base>.+?-PC)-(?P<rev>\d+(?:-\d+)*)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,11 @@ def parse_base_rev(name: str) -> tuple[str, tuple[int, ...] | None]:
     if not s:
         return s, None
 
+    m_pc = PC_WITH_REV_RE.match(s)
+    if m_pc:
+        rev = tuple(int(x) for x in m_pc.group("rev").split("-") if x.isdigit())
+        return m_pc.group("base"), (rev or None)
+
     parts = s.split("-")
     if len(parts) >= 3 and all(p.isdigit() for p in parts):
         # Treat the first two segments as base and the rest as revision chain.
@@ -51,6 +57,30 @@ def parse_base_rev(name: str) -> tuple[str, tuple[int, ...] | None]:
         return m.group("base"), (int(m.group("rev")),)
 
     return s, None
+
+
+def parse_rev_for_explicit_base(name: str, base: str) -> tuple[int, ...] | None:
+    n = (name or "").strip()
+    b = (base or "").strip()
+    if not n or not b:
+        return None
+
+    if n.upper() == b.upper():
+        # Exact filename match with no revision suffix.
+        return ()
+
+    prefix = f"{b}-"
+    if not n.upper().startswith(prefix.upper()):
+        return None
+
+    tail = n[len(prefix) :].strip()
+    if not tail:
+        return None
+
+    parts = tail.split("-")
+    if not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
 
 
 def better_candidate(a: Candidate | None, b: Candidate) -> Candidate:
@@ -153,7 +183,7 @@ def iter_files(search_root: Path, exts: set[str]) -> tuple[int, int, list[Path]]
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Look up part files on a drive, pick latest numeric -<rev>, and copy into each Asm folder."
+        description="Look up part files on a drive, pick latest numeric -<rev>, and copy into each Asm folder. PowderCoat parts also look for '<Part>-PC-<rev>'."
     )
     parser.add_argument(
         "--ops-root",
@@ -245,11 +275,34 @@ def main() -> int:
 
     # Build requested bases from parts.
     requested_bases: set[str] = set()
+    requested_main_bases: set[str] = set()
     asm_part_base: list[tuple[str, str, str]] = []
+    asm_part_pc_base: list[tuple[str, str, str]] = []
+    asm_part_main_base: list[tuple[str, str, str]] = []
     skipped = 0
     for asm, part in entries:
         asm_key = asm.split(",", 1)[0].strip()
         info = asm_info.get(asm_key)
+        subgroup_l = (info.subgroup.strip().lower() if info and info.subgroup else "")
+        is_powdercoat = subgroup_l == "powdercoat"
+
+        # Always look up the top-level drawing for Asm 0 as "<Part>-<rev>".
+        if asm_key == "0":
+            main_base, _ = parse_base_rev(part)
+            if main_base:
+                requested_main_bases.add(main_base.upper())
+                asm_part_main_base.append((asm, part, main_base))
+
+        # Powder coat travelers remain in Assembly/PowderCoat, but their linked files
+        # are looked up as "<Part>-PC-<rev>".
+        if is_powdercoat:
+            base, _ = parse_base_rev(part)
+            if base:
+                pc_base = f"{base}-PC"
+                requested_bases.add(pc_base.upper())
+                asm_part_pc_base.append((asm, part, pc_base))
+            continue
+
         if info:
             if info.bucket and info.bucket.strip().lower() in skip_buckets:
                 skipped += 1
@@ -263,38 +316,50 @@ def main() -> int:
             asm_part_base.append((asm, part, base))
 
     print(f"Parts (unique bases): {len(requested_bases)}")
+    if asm_part_pc_base:
+        print(f"PowderCoat PC lookups: {len(asm_part_pc_base)}")
+    if asm_part_main_base:
+        print(f"Main Assembly lookups (Asm 0): {len(asm_part_main_base)}")
     if skipped:
         print(f"Skipped entries: {skipped} (bucket/subgroup filters)")
     print(f"Searching: {search_root}  (ext: {', '.join(sorted(exts)) or 'ANY'})")
 
-    if not requested_bases:
+    if not requested_bases and not requested_main_bases:
         out_manifest = ops_root / "rev_pull_manifest.csv"
         with out_manifest.open("w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
             w.writerow(["asm", "bucket", "subgroup", "part", "base", "picked_rev", "source_path", "dest_path", "status"])
         print(f"Wrote: {out_manifest}")
-        print("No parts to pull after filters.")
+        print("No parts to pull after filters and main-assembly rules.")
         return 0
 
     # Scan once, collect best candidate per base.
     best: dict[str, Candidate] = {}
+    best_main: dict[str, Candidate] = {}
     scanned_dirs, scanned_files, files = iter_files(search_root, exts)
     print(f"Scanned: {scanned_dirs} folders, {scanned_files} files")
 
     for p in files:
         stem = p.stem
-        base, rev = parse_base_rev(stem)
-        if not base:
-            continue
-        key = base.upper()
-        if key not in requested_bases:
-            continue
         try:
             mtime = p.stat().st_mtime
         except OSError:
             continue
-        cand = Candidate(rev=rev, path=p, mtime=mtime)
-        best[key] = better_candidate(best.get(key), cand)
+
+        base, rev = parse_base_rev(stem)
+        if base:
+            key = base.upper()
+            if key in requested_bases:
+                cand = Candidate(rev=rev, path=p, mtime=mtime)
+                best[key] = better_candidate(best.get(key), cand)
+
+        if requested_main_bases:
+            for main_key in requested_main_bases:
+                main_rev = parse_rev_for_explicit_base(stem, main_key)
+                if main_rev is None:
+                    continue
+                cand_main = Candidate(rev=(main_rev or None), path=p, mtime=mtime)
+                best_main[main_key] = better_candidate(best_main.get(main_key), cand_main)
 
     out_manifest = ops_root / "rev_pull_manifest.csv"
     rows: list[list[str]] = []
@@ -348,6 +413,82 @@ def main() -> int:
                 missing += 1
                 rows[-1][-1] = "COPY_FAILED"
 
+    for asm, part, pc_base in asm_part_pc_base:
+        asm_key = asm.split(",", 1)[0].strip()
+        info = asm_info.get(asm_key)
+        bucket = info.bucket if info else ""
+        subgroup = info.subgroup if info else ""
+
+        dest_folder = info.folder if info else None
+        if dest_folder is None:
+            missing += 1
+            rows.append([asm, bucket, subgroup, f"{part} (PC)", pc_base, "", "", "", "ASM_FOLDER_MISSING"])
+            continue
+
+        key = pc_base.upper()
+        cand = best.get(key)
+        if cand is None:
+            missing += 1
+            rows.append([asm, bucket, subgroup, f"{part} (PC)", pc_base, "", "", str(dest_folder), "NOT_FOUND"])
+            continue
+
+        src = cand.path
+        dest_path = dest_folder / src.name
+        if dest_path.exists():
+            rev_str = "-".join(str(r) for r in (cand.rev or ()))
+            rows.append([asm, bucket, subgroup, f"{part} (PC)", pc_base, rev_str, str(src), str(dest_path), "ALREADY_EXISTS"])
+            continue
+
+        dest_path = unique_dest_path(dest_path)
+        rev_str = "-".join(str(r) for r in (cand.rev or ()))
+        rows.append([asm, bucket, subgroup, f"{part} (PC)", pc_base, rev_str, str(src), str(dest_path), "COPIED" if not args.dry_run else "DRY_RUN"])
+        if not args.dry_run:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(src), str(dest_path))
+                copied += 1
+            except OSError:
+                missing += 1
+                rows[-1][-1] = "COPY_FAILED"
+
+    for asm, part, main_base in asm_part_main_base:
+        asm_key = asm.split(",", 1)[0].strip()
+        info = asm_info.get(asm_key)
+        bucket = info.bucket if info else ""
+        subgroup = info.subgroup if info else ""
+
+        dest_folder = info.folder if info else None
+        if dest_folder is None:
+            missing += 1
+            rows.append([asm, bucket, subgroup, f"{part} (MAIN ASM)", main_base, "", "", "", "ASM_FOLDER_MISSING"])
+            continue
+
+        key = main_base.upper()
+        cand = best_main.get(key)
+        if cand is None:
+            missing += 1
+            rows.append([asm, bucket, subgroup, f"{part} (MAIN ASM)", main_base, "", "", str(dest_folder), "NOT_FOUND"])
+            continue
+
+        src = cand.path
+        dest_path = dest_folder / src.name
+        if dest_path.exists():
+            rev_str = "-".join(str(r) for r in (cand.rev or ()))
+            rows.append([asm, bucket, subgroup, f"{part} (MAIN ASM)", main_base, rev_str, str(src), str(dest_path), "ALREADY_EXISTS"])
+            continue
+
+        dest_path = unique_dest_path(dest_path)
+        rev_str = "-".join(str(r) for r in (cand.rev or ()))
+        rows.append([asm, bucket, subgroup, f"{part} (MAIN ASM)", main_base, rev_str, str(src), str(dest_path), "COPIED" if not args.dry_run else "DRY_RUN"])
+        if not args.dry_run:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(src), str(dest_path))
+                copied += 1
+            except OSError:
+                missing += 1
+                rows[-1][-1] = "COPY_FAILED"
+
     with out_manifest.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["asm", "bucket", "subgroup", "part", "base", "picked_rev", "source_path", "dest_path", "status"])
@@ -381,7 +522,9 @@ def main() -> int:
         missing_lines: list[str] = []
         for asm, bucket, subgroup, part, base, picked_rev, source_path, dest_path, status in rows:
             b = (bucket or "").strip().lower()
-            if report_buckets and b not in report_buckets:
+            is_powdercoat = (subgroup or "").strip().lower() == "powdercoat"
+            is_main_asm = "(main asm)" in (part or "").strip().lower()
+            if report_buckets and b not in report_buckets and not is_powdercoat and not is_main_asm:
                 continue
             if status not in {"NOT_FOUND", "COPY_FAILED", "ASM_FOLDER_MISSING"}:
                 continue

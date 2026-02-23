@@ -59,8 +59,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--skip-sections",
-        default="Assembly,Welding/PowderCoat,Drawing Lookup (Latest Revs)",
-        help="Comma-separated ops_parts sections to skip (default: Assembly,Welding/PowderCoat,Drawing Lookup (Latest Revs))",
+        default="Assembly,Assembly/PowderCoat,Welding/PowderCoat,Drawing Lookup (Latest Revs)",
+        help="Comma-separated ops_parts sections to skip (default: Assembly,Assembly/PowderCoat,Welding/PowderCoat,Drawing Lookup (Latest Revs))",
     )
     parser.add_argument("--dry-run", action="store_true", help="Do not write PDFs/text, only print actions")
     args = parser.parse_args()

@@ -109,6 +109,8 @@ def choose_subgroup(cls: Classification, text: str, page_count: int) -> str | No
     text_upper = text.upper()
 
     if cls.bucket == "Assembly":
+        if "POWDER COAT" in text_upper or "POWDERCOAT" in text_upper:
+            return "PowderCoat"
         if "LASER ETCH" in text_upper:
             return "LaserEtch"
         if part_upper.startswith("CMN"):
@@ -120,8 +122,6 @@ def choose_subgroup(cls: Classification, text: str, page_count: int) -> str | No
         return None
 
     if cls.bucket == "Welding":
-        if "POWDER COAT" in text_upper or "POWDERCOAT" in text_upper:
-            return "PowderCoat"
         # Single-page travelers are very likely single-op; avoid cross-step subfolders.
         if page_count > 1 and cls.score_machining > 0 and cls.score_welding >= 6:
             return "Weld_to_Machine"
@@ -168,7 +168,7 @@ def classify(pdf_path: Path, text: str) -> Classification:
     if "ELC" in part_upper:
         return Classification("Assembly", asm, part, 0, 0, 0, "ELC* -> Assembly (electrical)")
     if "POWDER COAT" in score_upper or "POWDERCOAT" in score_upper:
-        return Classification("Welding", asm, part, 0, 0, 0, "Powder coat -> Welding")
+        return Classification("Assembly", asm, part, 0, 0, 0, "Powder coat -> Assembly")
     if "SAW CUT" in score_upper or "SAW-CUT" in score_upper or "SAWCUT" in score_upper:
         return Classification("Machining", asm, part, 0, 0, 0, "Saw cut -> Machining")
     if "KEY CUT" in score_upper or "KEYCUT" in score_upper or "KEY CUTTING" in score_upper:

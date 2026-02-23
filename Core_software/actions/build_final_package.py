@@ -87,7 +87,7 @@ def iter_asm_pdfs(op_root: Path) -> list[Path]:
 @dataclass(frozen=True)
 class AddRow:
     op: str
-    kind: str  # ASM|DRAW|ERROR
+    kind: str  # SUMMARY|ASM|DRAW|ERROR
     asm_key: str
     src: str
     pages: int
@@ -108,6 +108,7 @@ def build_op_package(
     op_name: str,
     op_root: Path,
     ops_root: Path,
+    section_summary_pdf: Path | None,
     rev_map: dict[str, list[str]],
     out_pdf: Path,
     rows: list[AddRow],
@@ -116,6 +117,33 @@ def build_op_package(
 
     writer = PdfWriter()
     total_pages = 0
+
+    if section_summary_pdf and section_summary_pdf.is_file():
+        try:
+            pages = add_pdf(writer, section_summary_pdf)
+        except Exception as e:
+            rows.append(
+                AddRow(
+                    op_name,
+                    "ERROR",
+                    "",
+                    str(section_summary_pdf),
+                    0,
+                    f"Summary read failed: {e}",
+                )
+            )
+        else:
+            total_pages += pages
+            rows.append(
+                AddRow(
+                    op_name,
+                    "SUMMARY",
+                    "",
+                    str(section_summary_pdf),
+                    pages,
+                    "Ops parts summary inserted at package front",
+                )
+            )
 
     for asm_pdf in iter_asm_pdfs(op_root):
         asm_key = asm_key_from_filename(asm_pdf) or ""
@@ -165,6 +193,11 @@ def main() -> int:
         default=None,
         help="Optional explicit output directory (overrides --out-root).",
     )
+    parser.add_argument(
+        "--ops-parts-covers-dir",
+        default=None,
+        help="Folder containing <Operation>_ops_parts.pdf files (default: <ops-root>/ops_parts_sections_pdf).",
+    )
     args = parser.parse_args()
 
     ops_root = Path(args.ops_root)
@@ -181,6 +214,12 @@ def main() -> int:
         out_dir = Path(args.out_root) / "final_packages" / f"DrawingPackage - {job} - {stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    covers_dir = (
+        Path(args.ops_parts_covers_dir)
+        if args.ops_parts_covers_dir
+        else (ops_root / "ops_parts_sections_pdf")
+    )
+
     rev_map = load_rev_manifest(ops_root)
     rows: list[AddRow] = []
 
@@ -191,10 +230,12 @@ def main() -> int:
         out_pdf = out_dir / f"{op}_Package.pdf"
         if not op_root.is_dir():
             continue
+        summary_pdf = covers_dir / f"{op}_ops_parts.pdf"
         pages = build_op_package(
             op_name=op,
             op_root=op_root,
             ops_root=ops_root,
+            section_summary_pdf=summary_pdf if summary_pdf.is_file() else None,
             rev_map=rev_map,
             out_pdf=out_pdf,
             rows=rows,

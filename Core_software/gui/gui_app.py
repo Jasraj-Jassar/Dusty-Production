@@ -20,6 +20,10 @@ try:
     from gui.preview_package import PreviewPackageWindow
 except ModuleNotFoundError:
     from preview_package import PreviewPackageWindow  # type: ignore
+try:
+    from gui.credits_window import CreditsWindow
+except ModuleNotFoundError:
+    from credits_window import CreditsWindow  # type: ignore
 
 
 APP_TITLE = "DustyBot"
@@ -45,6 +49,7 @@ ASSETS_DIR = GUI_DIR / "assets"
 ACTIONS_DIR = CORE_ROOT / "actions"
 # Default to P:\ (Pdrive). Override anytime via DUSTYBOT_SEARCH_ROOT.
 REV_SEARCH_ROOT = os.environ.get("DUSTYBOT_SEARCH_ROOT", "P:\\")
+DEFAULT_PRINT_PRINTER = "Kyocera TASKalfa 3501i"
 
 # Add Core_software/ to sys.path so `actions.*` imports work reliably.
 try:
@@ -67,8 +72,8 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("760x480")
-        self.minsize(700, 440)
+        self.geometry("1080x780")
+        self.minsize(900, 620)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
@@ -336,6 +341,22 @@ class App(ctk.CTk):
             status_message=f"History preview opened: {ops_root.parent.name}",
         )
 
+    def open_credits(self) -> None:
+        if getattr(self, "_credits_win", None) and self._credits_win.winfo_exists():
+            try:
+                self._credits_win.focus()
+                self._credits_win.lift()
+            except Exception:
+                pass
+            self.status_var.set("Credits opened.")
+            return
+
+        try:
+            self._credits_win = CreditsWindow(self)
+            self.status_var.set("Credits opened.")
+        except Exception:
+            self.status_var.set("Failed to open credits.")
+
     def print_package(self) -> None:
         if not self.ops_root.is_dir():
             self.status_var.set(f"ops_grouped not found: {self.ops_root}")
@@ -348,7 +369,10 @@ class App(ctk.CTk):
 
         try:
             only = (self.print_bucket_var.get() or "").strip()
+            printer = (self.print_printer_var.get() or "").strip()
             cmd = [sys.executable, str(print_script), "--ops-root", str(self.ops_root)]
+            if printer:
+                cmd.extend(["--asm-printer", printer, "--drawing-printer", printer])
             if only and only != "All":
                 cmd.extend(["--only", only])
 
@@ -392,7 +416,7 @@ class App(ctk.CTk):
         self.open_final_btn.configure(state="disabled")
 
         self.results_title.configure(text="Finalizing")
-        self.results_sub.configure(text="Appending inspection sheets and building final package")
+        self.results_sub.configure(text="Appending inspection sheets, creating ops summaries, and building final package")
         self.status_var.set("Finalizing package...")
 
         self.detail_box.configure(state="normal")
@@ -436,26 +460,96 @@ class App(ctk.CTk):
             else:
                 self._append_detail("Append complete.")
 
-            build_cmd = [
+            def run_build_final_package() -> None:
+                build_cmd = [
+                    sys.executable,
+                    str(ACTIONS_DIR / "build_final_package.py"),
+                    "--ops-root",
+                    str(self.ops_root),
+                    "--out-root",
+                    str(self.workspace_root),
+                ]
+
+                def on_build_output(line: str, _stream: str) -> None:
+                    # Keep the detail viewer quiet; append summary after completion.
+                    return
+
+                def on_build_done(bcode: int, bmsg: str, _berr: str) -> None:
+                    if bcode != 0:
+                        self._append_detail("Build Final Package: FAILED")
+                        if bmsg:
+                            self._append_detail(self.compact_log_detail(bmsg, limit=3500))
+                        self.results_title.configure(text="Finalization Failed")
+                        self.results_sub.configure(text="Final package build failed")
+                        self._layout_results(show_success=False, show_steps=False, show_detail=True, show_ops=False, show_actions=True)
+                        self._set_action_visibility(show_print=False, show_new_package=True, show_preview=True, show_open_final=False)
+                        self.preview_btn.configure(state="normal")
+                        self.new_pkg_btn.configure(state="normal")
+                        self.status_var.set("Finalization failed.")
+                        return
+
+                    self._append_detail("Build Final Package:")
+                    build_summary = self._summarize_build_output(bmsg or "")
+                    if build_summary:
+                        for line in build_summary:
+                            self._append_detail(line)
+                    else:
+                        self._append_detail("Build complete.")
+
+                    final_pdf = None
+                    out_dir = None
+                    for line in (bmsg or "").splitlines():
+                        line = line.strip()
+                        if line.startswith("FINAL_PDF:"):
+                            final_pdf = line.split(":", 1)[1].strip()
+                        elif line.startswith("OUT_DIR:"):
+                            out_dir = line.split(":", 1)[1].strip()
+
+                    self._set_action_visibility(show_print=False, show_new_package=False, show_preview=False, show_open_final=False)
+
+                    def open_final_preview() -> None:
+                        self.results_title.configure(text="Complete")
+                        if out_dir:
+                            self.results_sub.configure(text=f"Final package ready: {out_dir}")
+                        else:
+                            self.results_sub.configure(text="Final package ready")
+                        self._final_pdf_path = Path(final_pdf) if final_pdf else None
+                        self.show_ops_parts(show_detail=True, show_steps=False)
+                        self._set_action_visibility(
+                            show_print=True,
+                            show_new_package=True,
+                            show_preview=True,
+                            show_open_final=self._final_pdf_path is not None,
+                        )
+                        self.preview_btn.configure(state="normal")
+                        self.print_btn.configure(state="normal")
+                        self.new_pkg_btn.configure(state="normal")
+                        if self._final_pdf_path is not None:
+                            self.open_final_btn.configure(state="normal")
+                        self.status_var.set("Final package built.")
+
+                    self.show_success_inline(on_done=open_final_preview)
+
+                self._run_popen(build_cmd, cwd=str(self.workspace_root), on_done=on_build_done, on_output=on_build_output)
+
+            section_cmd = [
                 sys.executable,
-                str(ACTIONS_DIR / "build_final_package.py"),
+                str(ACTIONS_DIR / "build_ops_parts_section_pages.py"),
                 "--ops-root",
                 str(self.ops_root),
-                "--out-root",
-                str(self.workspace_root),
             ]
 
-            def on_build_output(line: str, _stream: str) -> None:
+            def on_section_output(line: str, _stream: str) -> None:
                 # Keep the detail viewer quiet; append summary after completion.
                 return
 
-            def on_build_done(bcode: int, bmsg: str, _berr: str) -> None:
-                if bcode != 0:
-                    self._append_detail("Build Final Package: FAILED")
-                    if bmsg:
-                        self._append_detail(self.compact_log_detail(bmsg, limit=3500))
+            def on_section_done(scode: int, smsg: str, _serr: str) -> None:
+                if scode != 0:
+                    self._append_detail("Build Ops Parts Summary Pages: FAILED")
+                    if smsg:
+                        self._append_detail(self.compact_log_detail(smsg, limit=3500))
                     self.results_title.configure(text="Finalization Failed")
-                    self.results_sub.configure(text="Final package build failed")
+                    self.results_sub.configure(text="Ops summary page generation failed")
                     self._layout_results(show_success=False, show_steps=False, show_detail=True, show_ops=False, show_actions=True)
                     self._set_action_visibility(show_print=False, show_new_package=True, show_preview=True, show_open_final=False)
                     self.preview_btn.configure(state="normal")
@@ -463,49 +557,17 @@ class App(ctk.CTk):
                     self.status_var.set("Finalization failed.")
                     return
 
-                self._append_detail("Build Final Package:")
-                summary_lines = self._summarize_build_output(bmsg or "")
+                self._append_detail("Build Ops Parts Summary Pages:")
+                summary_lines = self._summarize_ops_parts_pages_output(smsg or "")
                 if summary_lines:
                     for line in summary_lines:
                         self._append_detail(line)
                 else:
-                    self._append_detail("Build complete.")
+                    self._append_detail("Ops summary pages created.")
 
-                final_pdf = None
-                out_dir = None
-                for line in (bmsg or "").splitlines():
-                    line = line.strip()
-                    if line.startswith("FINAL_PDF:"):
-                        final_pdf = line.split(":", 1)[1].strip()
-                    elif line.startswith("OUT_DIR:"):
-                        out_dir = line.split(":", 1)[1].strip()
+                run_build_final_package()
 
-                self._set_action_visibility(show_print=False, show_new_package=False, show_preview=False, show_open_final=False)
-
-                def open_final_preview() -> None:
-                    self.results_title.configure(text="Complete")
-                    if out_dir:
-                        self.results_sub.configure(text=f"Final package ready: {out_dir}")
-                    else:
-                        self.results_sub.configure(text="Final package ready")
-                    self._final_pdf_path = Path(final_pdf) if final_pdf else None
-                    self.show_ops_parts(show_detail=True, show_steps=False)
-                    self._set_action_visibility(
-                        show_print=True,
-                        show_new_package=True,
-                        show_preview=True,
-                        show_open_final=self._final_pdf_path is not None,
-                    )
-                    self.preview_btn.configure(state="normal")
-                    self.print_btn.configure(state="normal")
-                    self.new_pkg_btn.configure(state="normal")
-                    if self._final_pdf_path is not None:
-                        self.open_final_btn.configure(state="normal")
-                    self.status_var.set("Final package built.")
-
-                self.show_success_inline(on_done=open_final_preview)
-
-            self._run_popen(build_cmd, cwd=str(self.workspace_root), on_done=on_build_done, on_output=on_build_output)
+            self._run_popen(section_cmd, cwd=str(self.workspace_root), on_done=on_section_done, on_output=on_section_output)
 
         self._run_popen(append_cmd, cwd=str(self.workspace_root), on_done=on_append_done, on_output=on_append_output)
 
@@ -560,6 +622,7 @@ class App(ctk.CTk):
         for w in (
             self.preview_btn,
             self.print_btn,
+            self.print_printer_menu,
             self.print_bucket_menu,
             self.open_final_btn,
             self.new_pkg_btn,
@@ -570,6 +633,8 @@ class App(ctk.CTk):
                 pass
 
         if show_print:
+            self._refresh_printer_choices()
+            self.print_printer_menu.pack(side="left", padx=(10, 0))
             self.print_bucket_menu.pack(side="left", padx=(10, 0))
             self.print_btn.pack(side="left", padx=(10, 0))
             if show_open_final:
@@ -579,9 +644,55 @@ class App(ctk.CTk):
         if show_new_package:
             self.new_pkg_btn.pack(side="left", padx=(10, 0))
 
+    def _list_printer_choices(self) -> list[str]:
+        names: list[str] = []
+        try:
+            r = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-Printer | Select-Object -ExpandProperty Name",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                for raw in (r.stdout or "").splitlines():
+                    name = raw.strip()
+                    if name and name not in names:
+                        names.append(name)
+        except Exception:
+            pass
+
+        ordered: list[str] = [DEFAULT_PRINT_PRINTER]
+        for n in sorted(names, key=str.casefold):
+            if n not in ordered:
+                ordered.append(n)
+        return ordered
+
+    def _refresh_printer_choices(self) -> None:
+        printers = self._list_printer_choices()
+        current = (self.print_printer_var.get() or "").strip()
+        self.print_printer_menu.configure(values=printers)
+        if current and current in printers:
+            self.print_printer_var.set(current)
+            return
+        if DEFAULT_PRINT_PRINTER in printers:
+            self.print_printer_var.set(DEFAULT_PRINT_PRINTER)
+            return
+        if printers:
+            self.print_printer_var.set(printers[0])
+
     def _set_upload_history_visibility(self, show: bool) -> None:
         try:
             self.preview_history_upload_btn.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.credits_upload_btn.pack_forget()
         except Exception:
             pass
 
@@ -590,9 +701,11 @@ class App(ctk.CTk):
 
         try:
             self.preview_history_upload_btn.pack(side="left", padx=(10, 0), before=self.upload_path_label)
+            self.credits_upload_btn.pack(side="left", padx=(10, 0), before=self.upload_path_label)
         except Exception:
             # Fallback if upload_path_label is not ready yet.
             self.preview_history_upload_btn.pack(side="left", padx=(10, 0))
+            self.credits_upload_btn.pack(side="left", padx=(10, 0))
 
     def _show_detail_box(self) -> None:
         self._layout_results(show_success=False, show_steps=True, show_detail=True, show_ops=False)
@@ -723,6 +836,7 @@ class App(ctk.CTk):
         self.browse_btn.pack(side="left")
 
         self.preview_history_upload_btn = ctk.CTkButton(actions, text="History", command=self.preview_history)
+        self.credits_upload_btn = ctk.CTkButton(actions, text="Credits", command=self.open_credits)
 
         self.upload_path_label = ctk.CTkLabel(actions, textvariable=self.path_var, text_color="gray70")
         self.upload_path_label.pack(side="left", padx=12, fill="x", expand=True)
@@ -786,6 +900,13 @@ class App(ctk.CTk):
             values=["All", "Assembly", "Machining", "Welding"],
             variable=self.print_bucket_var,
             width=140,
+        )
+        self.print_printer_var = ctk.StringVar(value=DEFAULT_PRINT_PRINTER)
+        self.print_printer_menu = ctk.CTkOptionMenu(
+            self.actions_row,
+            values=[DEFAULT_PRINT_PRINTER],
+            variable=self.print_printer_var,
+            width=260,
         )
 
         self.new_pkg_btn = ctk.CTkButton(self.actions_row, text="New Job", command=self.run_new_package)
@@ -1056,9 +1177,6 @@ class App(ctk.CTk):
             run_pull()
 
         self._run_popen(combine_cmd, cwd=str(self.workspace_root), on_done=on_combine_done)
-        return
-
-        # finish() called from on_pull_done
 
     def run_new_package(self) -> None:
         self.new_pkg_btn.configure(state="disabled")
@@ -1128,6 +1246,20 @@ class App(ctk.CTk):
                 lines.append(line)
                 continue
             if line.startswith("OUT_DIR:"):
+                lines.append(line)
+                continue
+        return lines
+
+    def _summarize_ops_parts_pages_output(self, message: str) -> list[str]:
+        lines: list[str] = []
+        for raw in (message or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("Wrote:"):
+                lines.append(line)
+                continue
+            if line.startswith("Generated section cover PDFs:"):
                 lines.append(line)
                 continue
         return lines

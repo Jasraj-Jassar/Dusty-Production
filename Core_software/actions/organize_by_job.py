@@ -86,7 +86,7 @@ def main() -> int:
     parser.add_argument(
         "--workspace-root",
         default=str(Path.cwd()),
-        help="Workspace root that contains insert-traveler/, ops_grouped/, final_packages/, printing_jobs/ (default: cwd)",
+        help="Workspace root that contains insert-traveler/, ops_grouped/, final_packages/ (default: cwd)",
     )
     args = parser.parse_args()
 
@@ -94,8 +94,7 @@ def main() -> int:
     ws_root = Path(args.workspace_root).resolve()
 
     insert_traveler = ws_root / "insert-traveler"
-    printing_jobs = ws_root / "printing_jobs"
-    sources = [insert_traveler, printing_jobs]
+    sources = [insert_traveler]
 
     job = get_job_from_parts_txt(insert_traveler / "parts.txt")
     if not job:
@@ -171,7 +170,6 @@ def main() -> int:
 
     # Streamline: clean up empty temp folders after archiving.
     _prune_empty_dirs(ws_root / "insert-traveler")
-    _prune_empty_dirs(ws_root / "printing_jobs")
     _prune_empty_dirs(ws_root / "ops_grouped")
     _prune_empty_dirs(ws_root / "final_packages")
 

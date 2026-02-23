@@ -23,6 +23,7 @@ Runtime location:
      - `ops_grouped/Assembly/`
      - `ops_grouped/Machining/`
      - `ops_grouped/Welding/`
+   - Powder coat operations are grouped under `ops_grouped/Assembly/PowderCoat/`
    - Removes `insert-traveler/asm_split/` if it becomes empty after moving
    - Output: `ops_grouped/manifest.csv`
 
@@ -39,18 +40,38 @@ Runtime location:
    - Runs `actions/combine_asms_by_part.py`
    - If two Asm PDFs in the same operation folder share the same `Part:`, they get merged into one `Asm_<a>_<b>.pdf`
    - Updates `ops_grouped/ops_parts.txt`
-   - Skips `Assembly` by default
+   - Skips `Assembly` and PowderCoat sections by default
 
 8. Pull Latest Part Revisions (From Drive)
    - Runs `actions/pull_latest_revs.py`
    - Reads: `ops_grouped/ops_parts.txt` and `ops_grouped/manifest.csv`
    - Searches a drive/folder (default `P:\\`, override via `DUSTYBOT_SEARCH_ROOT`)
-   - By default skips `Assembly` and `PowderCoat` (`--skip-buckets`, `--skip-subgroups`)
+   - By default skips `Assembly` and `PowderCoat` for standard drawing lookup (`--skip-buckets`, `--skip-subgroups`)
+   - `Assembly/PowderCoat` entries also look for PowderCoat files named like `<Part>-PC-<rev>` (for example, `HD2L-150-PC-1`)
+   - Asm `0` always looks for a top-level main assembly drawing named like `<Part>-<rev>` (for example, `HD2L-150-4`), and reports `NOT_FOUND` if missing
    - For a part like `10-0845`, if it finds `10-0845-2` and `10-0845-1`, it picks `-2`
    - Copies the picked file into the same folder as that `Asm_<n>.pdf`
    - Output: `ops_grouped/rev_pull_manifest.csv`
 
-9. Job (Start Next)
+9. Build Final Packages (Automatic)
+   - Runs `actions/append_inspection_sheets.py`
+   - Runs `actions/build_ops_parts_section_pages.py`
+   - Output: `ops_grouped/ops_parts_sections_pdf/Assembly_ops_parts.pdf`, `.../Machining_ops_parts.pdf`, `.../Welding_ops_parts.pdf`
+   - Runs `actions/build_final_package.py`
+   - Inserts each operation summary page at the front of the matching final package
+   - Output folder: `final_packages/DrawingPackage - <job> - <timestamp>/`
+
+10. Print Package
+   - Runs `actions/print_ops_grouped.py`
+   - Prints per operation in order:
+     - operation `ops_parts` summary page
+     - for Welding, PowderCoat PC files print right after the Welding summary page
+     - traveler `Asm_<n>.pdf` files
+     - linked drawing PDFs
+   - Tabloid drawings are hard-rotated using temporary files at print time (`--hard-rotate-drawings`)
+   - Temporary rotated files are deleted automatically; files in `ops_grouped/` are not modified
+
+11. Job (Start Next)
    - GUI button: `Job`
    - Resets the app for next import
    - No additional archive move is performed
