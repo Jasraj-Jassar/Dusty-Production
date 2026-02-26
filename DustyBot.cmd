@@ -4,7 +4,7 @@ title DustyBot
 cd /d "%~dp0"
 
 set "APP_SCRIPT=%~dp0Core_software\gui\gui_app.py"
-set "REQ_FILE=%~dp0Core_software\requirements.txt"
+set "REQ_FILE=%~dp0requirements.txt"
 set "VENV_DIR=%~dp0.venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 set "DEPS_STAMP=%VENV_DIR%\.deps_hash"
@@ -207,7 +207,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if defined REQ_HASH > "%DEPS_STAMP%" echo %REQ_HASH%
+if defined REQ_HASH (
+    > "%DEPS_STAMP%" <nul set /p "=%REQ_HASH%"
+)
 echo.
 echo  Dependencies installed.
 exit /b 0

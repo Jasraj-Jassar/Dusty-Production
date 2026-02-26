@@ -1,0 +1,7 @@
+# Root dependency entrypoint for DustyBot.
+# Core GUI + pipeline dependencies:
+-r Core_software/requirements.txt
+
+# Integrated Serial Entry automation dependencies:
+selenium>=4.20.0
+pynput>=1.7.6

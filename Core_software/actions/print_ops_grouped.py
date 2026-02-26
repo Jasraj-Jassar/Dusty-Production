@@ -15,6 +15,7 @@ DEFAULT_SLEEP_SECONDS = 0.2
 
 # Match Asm_11.pdf or Asm_25_31.pdf
 _ASM_RE = re.compile(r"^Asm_(\d+(?:_\d+)*)\.pdf$", re.IGNORECASE)
+CROSS_SUBGROUPS = {"weld_to_machine", "machine_to_weld", "machin_to_weld"}
 
 
 def asm_sort_key(name: str) -> tuple[int, tuple[int, ...], str]:
@@ -58,6 +59,28 @@ def find_sumatra(explicit_path: str | None) -> str | None:
 
     which = shutil.which("SumatraPDF.exe") or shutil.which("SumatraPDF")
     return which
+
+
+def resolve_sheet_any(primary: Path, fallbacks: list[Path]) -> Path | None:
+    if primary.is_file():
+        return primary
+    for fb in fallbacks:
+        if fb.is_file():
+            return fb
+    return None
+
+
+def pdf_page_count(pdf: Path) -> int | None:
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(str(pdf)).pages)
+    except Exception:
+        return None
+
+
+def settings_with_range(settings: str, page_range: str) -> str:
+    return f"{settings},{page_range}"
 
 
 def load_rev_manifest(ops_root: Path) -> dict[str, list[str]]:
@@ -124,7 +147,7 @@ def load_powdercoat_paths(ops_root: Path) -> list[str]:
     return sorted(out, key=str.lower)
 
 
-def load_group_manifest(ops_root: Path) -> dict[str, str]:
+def load_group_manifest(ops_root: Path) -> dict[str, tuple[str, str]]:
     """Return filename -> (bucket, subgroup) from ops_grouped/manifest.csv."""
     manifest_path = ops_root / "manifest.csv"
     if not manifest_path.is_file():
@@ -332,17 +355,41 @@ def main() -> int:
     rev_map = load_rev_manifest(ops_root)
     powdercoat_drawings = resolve_drawings(ops_root, load_powdercoat_paths(ops_root))
 
+    core_root = Path(__file__).resolve().parents[1]
+    weld_sheet_path = resolve_sheet_any(
+        Path.cwd() / "weld_inspect_sheet.pdf",
+        [
+            Path.cwd() / "Inspection_files" / "weld_inspect_sheet.pdf",
+            core_root / "Inspection_files" / "weld_inspect_sheet.pdf",
+        ],
+    )
+    mach_sheet_path = resolve_sheet_any(
+        Path.cwd() / "mech_inspect_sheet.pdf",
+        [
+            Path.cwd() / "Inspection_files" / "mech_inspect_sheet.pdf",
+            core_root / "Inspection_files" / "mech_inspect_sheet.pdf",
+        ],
+    )
+    weld_sheet_pages = pdf_page_count(weld_sheet_path) if weld_sheet_path else 0
+    mach_sheet_pages = pdf_page_count(mach_sheet_path) if mach_sheet_path else 0
+
     # Sumatra settings
     asm_settings = "fit,paper=letter,duplex=off"
+    asm_inspection_settings = "fit,paper=letter,duplex=on"
     # Drawings are printed in tabloid without the previous 180-degree flip
     # so the sheet orientation faces the operator at pickup.
     draw_settings = "fit,paper=tabloid,duplex=off,rotation=0"
 
     print(f"SumatraPDF: {sumatra}")
     print(f"Asm printer: {args.asm_printer}  settings: {asm_settings}")
+    print(f"Inspection settings: {asm_inspection_settings}")
     print(f"Drawing printer: {args.drawing_printer}  settings: {draw_settings}")
     print(f"Hard rotate drawings: {'on' if rotate_drawings else 'off'}")
     print(f"Asm count: {len(asm_pdfs)}")
+    if weld_sheet_pages:
+        print(f"Weld inspection pages: {weld_sheet_pages}")
+    if mach_sheet_pages:
+        print(f"Machining inspection pages: {mach_sheet_pages}")
 
     failures = 0
     printed_bucket_covers: set[str] = set()
@@ -366,6 +413,22 @@ def main() -> int:
             hard_rotate_pdf(src, out_pdf, degrees=180)
             rotated_cache[key] = out_pdf
             return out_pdf
+
+        def asm_has_cross_subgroup(asm_pdf: Path) -> bool:
+            try:
+                rel = asm_pdf.relative_to(ops_root)
+            except Exception:
+                return False
+            return any(p.strip().lower() in CROSS_SUBGROUPS for p in rel.parts)
+
+        def inspection_pages_for_asm(asm_pdf: Path, bucket: str) -> int:
+            if asm_has_cross_subgroup(asm_pdf):
+                return (weld_sheet_pages or 0) + (mach_sheet_pages or 0)
+            if bucket == "Welding":
+                return weld_sheet_pages or 0
+            if bucket == "Machining":
+                return mach_sheet_pages or 0
+            return 0
 
         for asm_pdf in asm_pdfs:
             asm_key = asm_key_from_filename(asm_pdf)
@@ -406,15 +469,44 @@ def main() -> int:
                 printed_bucket_covers.add(bucket)
 
             print(f"\nAsm: {asm_pdf}")
-
-            if args.dry_run:
-                print(f"[DRY] Asm -> {asm_pdf}")
+            inspection_pages = inspection_pages_for_asm(asm_pdf, bucket)
+            total_pages = pdf_page_count(asm_pdf) if inspection_pages > 0 else None
+            if inspection_pages > 0 and total_pages and total_pages > inspection_pages:
+                traveler_last_page = total_pages - inspection_pages
+                traveler_range = f"1-{traveler_last_page}"
+                inspection_range = f"{traveler_last_page + 1}-{total_pages}"
+                traveler_settings = settings_with_range(asm_settings, traveler_range)
+                inspection_settings = settings_with_range(asm_inspection_settings, inspection_range)
+                if args.dry_run:
+                    print(f"[DRY] Asm Traveler (single) -> {asm_pdf} pages {traveler_range}")
+                    print(f"[DRY] Asm Inspection (double) -> {asm_pdf} pages {inspection_range}")
+                else:
+                    rc = print_pdf(sumatra, args.asm_printer, traveler_settings, asm_pdf)
+                    if rc != 0:
+                        failures += 1
+                        print(f"Failed Asm Traveler: {asm_pdf} (exit {rc})")
+                    time.sleep(args.sleep)
+                    rc = print_pdf(sumatra, args.asm_printer, inspection_settings, asm_pdf)
+                    if rc != 0:
+                        failures += 1
+                        print(f"Failed Asm Inspection: {asm_pdf} (exit {rc})")
+                    time.sleep(args.sleep)
             else:
-                rc = print_pdf(sumatra, args.asm_printer, asm_settings, asm_pdf)
-                if rc != 0:
-                    failures += 1
-                    print(f"Failed Asm: {asm_pdf} (exit {rc})")
-                time.sleep(args.sleep)
+                if inspection_pages > 0 and not total_pages:
+                    print(f"Warning: unable to read page count for inspection split, printing single-sided: {asm_pdf}")
+                if inspection_pages > 0 and total_pages and total_pages <= inspection_pages:
+                    print(
+                        f"Warning: inspection page estimate ({inspection_pages}) >= total pages ({total_pages}), "
+                        f"printing single-sided: {asm_pdf}"
+                    )
+                if args.dry_run:
+                    print(f"[DRY] Asm -> {asm_pdf}")
+                else:
+                    rc = print_pdf(sumatra, args.asm_printer, asm_settings, asm_pdf)
+                    if rc != 0:
+                        failures += 1
+                        print(f"Failed Asm: {asm_pdf} (exit {rc})")
+                    time.sleep(args.sleep)
 
             drawings: list[Path] = []
             if asm_key:

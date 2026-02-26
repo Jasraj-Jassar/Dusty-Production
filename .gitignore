@@ -45,3 +45,15 @@ coverage.xml
 venv/
 ENV/
 env/
+
+# Serial/Chrome automation local state
+**/.chrome_profile/
+**/.chrome_profile_debug/
+**/DevToolsActivePort
+**/SingletonLock
+**/SingletonSocket
+**/SingletonCookie
+**/chrome_debug.log
+**/chromedriver*.log
+**/temp_profile.html
+**/serial_entry_gui_settings.json

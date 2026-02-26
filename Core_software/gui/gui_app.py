@@ -24,6 +24,10 @@ try:
     from gui.credits_window import CreditsWindow
 except ModuleNotFoundError:
     from credits_window import CreditsWindow  # type: ignore
+try:
+    from gui.serial_entry_window import SerialEntryWindow
+except ModuleNotFoundError:
+    from serial_entry_window import SerialEntryWindow  # type: ignore
 
 
 APP_TITLE = "DustyBot"
@@ -68,6 +72,30 @@ def _pick_workspace_root(data_root: Path) -> Path:
         pass
     return ws
 
+
+def _find_serial_automation_script(repo_root: Path) -> Path | None:
+    """Resolve the serial entry automation script from likely folder names first."""
+    likely_dirs = [
+        repo_root / "Serialnumber Enter Autoamtion",
+        repo_root / "SerialNumber Enter automation",
+        repo_root / "SerialNumber Enter Automation",
+    ]
+    for folder in likely_dirs:
+        script = folder / "serial_entry_automation.py"
+        if script.is_file():
+            return script.resolve()
+
+    skip_parts = {".git", ".venv", "venv", "__pycache__"}
+    try:
+        for script in repo_root.rglob("serial_entry_automation.py"):
+            if any(part in skip_parts for part in script.parts):
+                continue
+            return script.resolve()
+    except Exception:
+        pass
+    return None
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -78,7 +106,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
-        self.status_var = ctk.StringVar(value="Click Browse to select a PDF Or check out History.")
+        self.status_var = ctk.StringVar(value="Click Browse to select a PDF. Or use Serial Entry / History.")
         self.path_var = ctk.StringVar(value="")
         self._success_cache: tuple[list[ctk.CTkImage], int] | None = None
         self._upload_logo_image: ctk.CTkImage | None = None
@@ -88,6 +116,12 @@ class App(ctk.CTk):
         self.workspace_root = _pick_workspace_root(self.data_root)
         self.target_dir = self.workspace_root / "insert-traveler"
         self.ops_root = self.workspace_root / "ops_grouped"
+        self.serial_automation_script = _find_serial_automation_script(self.repo_root)
+        self.serial_settings_file = (
+            self.serial_automation_script.parent / "serial_entry_gui_settings.json"
+            if self.serial_automation_script
+            else (self.repo_root / "Serialnumber Enter Autoamtion" / "serial_entry_gui_settings.json")
+        )
 
         self._build_ui()
         self._init_steps()
@@ -356,6 +390,38 @@ class App(ctk.CTk):
             self.status_var.set("Credits opened.")
         except Exception:
             self.status_var.set("Failed to open credits.")
+
+    def open_serial_entry(self) -> None:
+        if not self.serial_automation_script or not self.serial_automation_script.is_file():
+            self.serial_automation_script = _find_serial_automation_script(self.repo_root)
+            if self.serial_automation_script:
+                self.serial_settings_file = (
+                    self.serial_automation_script.parent / "serial_entry_gui_settings.json"
+                )
+
+        if not self.serial_automation_script or not self.serial_automation_script.is_file():
+            self.status_var.set("Serial entry automation script not found.")
+            return
+
+        if getattr(self, "_serial_entry_win", None) and self._serial_entry_win.winfo_exists():
+            try:
+                self._serial_entry_win.focus()
+                self._serial_entry_win.lift()
+            except Exception:
+                pass
+            self.status_var.set("Serial Entry opened.")
+            return
+
+        try:
+            self._serial_entry_win = SerialEntryWindow(
+                self,
+                automation_script=self.serial_automation_script,
+                settings_file=self.serial_settings_file,
+                set_status=self.status_var.set,
+            )
+            self.status_var.set("Serial Entry opened.")
+        except Exception:
+            self.status_var.set("Failed to open Serial Entry.")
 
     def print_package(self) -> None:
         if not self.ops_root.is_dir():
@@ -686,7 +752,11 @@ class App(ctk.CTk):
         if printers:
             self.print_printer_var.set(printers[0])
 
-    def _set_upload_history_visibility(self, show: bool) -> None:
+    def _set_upload_shortcuts_visibility(self, show: bool) -> None:
+        try:
+            self.serial_entry_upload_btn.pack_forget()
+        except Exception:
+            pass
         try:
             self.preview_history_upload_btn.pack_forget()
         except Exception:
@@ -700,10 +770,12 @@ class App(ctk.CTk):
             return
 
         try:
+            self.serial_entry_upload_btn.pack(side="left", padx=(10, 0), before=self.upload_path_label)
             self.preview_history_upload_btn.pack(side="left", padx=(10, 0), before=self.upload_path_label)
             self.credits_upload_btn.pack(side="left", padx=(10, 0), before=self.upload_path_label)
         except Exception:
             # Fallback if upload_path_label is not ready yet.
+            self.serial_entry_upload_btn.pack(side="left", padx=(10, 0))
             self.preview_history_upload_btn.pack(side="left", padx=(10, 0))
             self.credits_upload_btn.pack(side="left", padx=(10, 0))
 
@@ -835,12 +907,17 @@ class App(ctk.CTk):
         self.browse_btn = ctk.CTkButton(actions, text="Browse PDF", command=self.on_browse)
         self.browse_btn.pack(side="left")
 
+        self.serial_entry_upload_btn = ctk.CTkButton(
+            actions,
+            text="Serial Entry",
+            command=self.open_serial_entry,
+        )
         self.preview_history_upload_btn = ctk.CTkButton(actions, text="History", command=self.preview_history)
         self.credits_upload_btn = ctk.CTkButton(actions, text="Credits", command=self.open_credits)
 
         self.upload_path_label = ctk.CTkLabel(actions, textvariable=self.path_var, text_color="gray70")
         self.upload_path_label.pack(side="left", padx=12, fill="x", expand=True)
-        self._set_upload_history_visibility(True)
+        self._set_upload_shortcuts_visibility(True)
 
         status_label = ctk.CTkLabel(self.upload_frame, textvariable=self.status_var, text_color="gray70")
         status_label.pack(anchor="w", pady=(6, 0))
@@ -967,7 +1044,7 @@ class App(ctk.CTk):
 
     def lock_upload_ui(self) -> None:
         self.browse_btn.configure(state="disabled")
-        self._set_upload_history_visibility(False)
+        self._set_upload_shortcuts_visibility(False)
 
     def run_extract_and_show(self) -> None:
         self._set_step("Extract Parts", "RUN")
@@ -1187,9 +1264,9 @@ class App(ctk.CTk):
         self.results_frame.pack_forget()
         self.upload_frame.pack(fill="both", expand=True)
         self.path_var.set("")
-        self.status_var.set("Click Browse to select a PDF. Or check out History.")
+        self.status_var.set("Click Browse to select a PDF. Or use Serial Entry / History.")
         self.browse_btn.configure(state="normal")
-        self._set_upload_history_visibility(True)
+        self._set_upload_shortcuts_visibility(True)
         self.print_btn.configure(state="disabled")
         self.open_final_btn.configure(state="disabled")
         self._final_pdf_path = None
