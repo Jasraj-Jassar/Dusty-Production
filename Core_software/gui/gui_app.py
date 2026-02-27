@@ -733,10 +733,13 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-        ordered: list[str] = [DEFAULT_PRINT_PRINTER]
-        for n in sorted(names, key=str.casefold):
-            if n not in ordered:
-                ordered.append(n)
+        if not names:
+            return [DEFAULT_PRINT_PRINTER]
+
+        ordered = sorted(names, key=str.casefold)
+        if DEFAULT_PRINT_PRINTER in ordered:
+            ordered.remove(DEFAULT_PRINT_PRINTER)
+            ordered.insert(0, DEFAULT_PRINT_PRINTER)
         return ordered
 
     def _refresh_printer_choices(self) -> None:

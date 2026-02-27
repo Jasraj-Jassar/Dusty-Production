@@ -61,6 +61,49 @@ def find_sumatra(explicit_path: str | None) -> str | None:
     return which
 
 
+def list_installed_printers(timeout_seconds: int = 5) -> list[str]:
+    names: list[str] = []
+    try:
+        r = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Printer | Select-Object -ExpandProperty Name",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+        if r.returncode != 0:
+            return []
+        for raw in (r.stdout or "").splitlines():
+            name = raw.strip()
+            if name and name not in names:
+                names.append(name)
+    except Exception:
+        return []
+    return names
+
+
+def normalize_printer_name(name: str) -> str:
+    return " ".join((name or "").split()).casefold()
+
+
+def resolve_printer_name(requested: str, installed: list[str]) -> str | None:
+    target = (requested or "").strip()
+    if not target:
+        return None
+    if target in installed:
+        return target
+    target_norm = normalize_printer_name(target)
+    norm_matches = [p for p in installed if normalize_printer_name(p) == target_norm]
+    if len(norm_matches) == 1:
+        return norm_matches[0]
+    return None
+
+
 def resolve_sheet_any(primary: Path, fallbacks: list[Path]) -> Path | None:
     if primary.is_file():
         return primary
@@ -222,7 +265,16 @@ def find_ops_parts_cover(ops_root: Path, bucket: str) -> Path | None:
     return p if p.is_file() else None
 
 
-def print_pdf(sumatra: str, printer: str, settings: str, pdf: Path) -> int:
+def format_failure_detail(output: str) -> str:
+    msg = " ".join((output or "").split())
+    if not msg:
+        return ""
+    if len(msg) > 220:
+        msg = f"{msg[:217]}..."
+    return f" - {msg}"
+
+
+def print_pdf(sumatra: str, printer: str, settings: str, pdf: Path) -> tuple[int, str]:
     cmd = [
         sumatra,
         "-print-to",
@@ -232,8 +284,9 @@ def print_pdf(sumatra: str, printer: str, settings: str, pdf: Path) -> int:
         "-silent",
         str(pdf),
     ]
-    completed = subprocess.run(cmd, check=False)
-    return completed.returncode
+    completed = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    detail = (completed.stderr or "").strip() or (completed.stdout or "").strip()
+    return completed.returncode, detail
 
 
 def hard_rotate_pdf(src_pdf: Path, out_pdf: Path, degrees: int = 180) -> None:
@@ -312,6 +365,34 @@ def main() -> int:
         print("Error: SumatraPDF not found.")
         print("Install SumatraPDF or pass --sumatra with the full path to SumatraPDF.exe.")
         return 3
+
+    args.asm_printer = (args.asm_printer or "").strip() or DEFAULT_PRINTER
+    args.drawing_printer = (args.drawing_printer or "").strip() or DEFAULT_PRINTER
+    installed_printers = list_installed_printers()
+    if installed_printers:
+        resolved_asm = resolve_printer_name(args.asm_printer, installed_printers)
+        resolved_drawing = resolve_printer_name(args.drawing_printer, installed_printers)
+        missing: list[tuple[str, str]] = []
+        if not resolved_asm:
+            missing.append(("Asm", args.asm_printer))
+        if not resolved_drawing:
+            missing.append(("Drawing", args.drawing_printer))
+        if missing:
+            print("Error: requested printer not found.")
+            for label, requested in missing:
+                print(f"{label} printer requested: {requested}")
+            print("Installed printers:")
+            for p in installed_printers:
+                print(f"- {p}")
+            return 2
+        if resolved_asm != args.asm_printer:
+            print(f"Resolved Asm printer to installed name: {resolved_asm}")
+        if resolved_drawing != args.drawing_printer:
+            print(f"Resolved Drawing printer to installed name: {resolved_drawing}")
+        args.asm_printer = resolved_asm
+        args.drawing_printer = resolved_drawing
+    else:
+        print("Warning: unable to query installed printers; skipping printer preflight checks.")
 
     asm_pdfs = [p for p in ops_root.rglob("*.pdf") if _ASM_RE.match(p.name)]
     manifest_info = load_group_manifest(ops_root)
@@ -441,10 +522,10 @@ def main() -> int:
                     if args.dry_run:
                         print(f"[DRY] Ops Summary -> {cover_pdf}")
                     else:
-                        rc = print_pdf(sumatra, args.asm_printer, asm_settings, cover_pdf)
+                        rc, detail = print_pdf(sumatra, args.asm_printer, asm_settings, cover_pdf)
                         if rc != 0:
                             failures += 1
-                            print(f"Failed Ops Summary: {cover_pdf} (exit {rc})")
+                            print(f"Failed Ops Summary: {cover_pdf} (exit {rc}){format_failure_detail(detail)}")
                         time.sleep(args.sleep)
 
                     if bucket == "Welding" and powdercoat_drawings:
@@ -461,10 +542,10 @@ def main() -> int:
                                 failures += 1
                                 print(f"Failed PowderCoat hard-rotate: {pc_pdf} ({e})")
                                 continue
-                            rc = print_pdf(sumatra, args.drawing_printer, draw_settings, printable_pc)
+                            rc, detail = print_pdf(sumatra, args.drawing_printer, draw_settings, printable_pc)
                             if rc != 0:
                                 failures += 1
-                                print(f"Failed PowderCoat: {pc_pdf} (exit {rc})")
+                                print(f"Failed PowderCoat: {pc_pdf} (exit {rc}){format_failure_detail(detail)}")
                             time.sleep(args.sleep)
                 printed_bucket_covers.add(bucket)
 
@@ -481,15 +562,15 @@ def main() -> int:
                     print(f"[DRY] Asm Traveler (single) -> {asm_pdf} pages {traveler_range}")
                     print(f"[DRY] Asm Inspection (double) -> {asm_pdf} pages {inspection_range}")
                 else:
-                    rc = print_pdf(sumatra, args.asm_printer, traveler_settings, asm_pdf)
+                    rc, detail = print_pdf(sumatra, args.asm_printer, traveler_settings, asm_pdf)
                     if rc != 0:
                         failures += 1
-                        print(f"Failed Asm Traveler: {asm_pdf} (exit {rc})")
+                        print(f"Failed Asm Traveler: {asm_pdf} (exit {rc}){format_failure_detail(detail)}")
                     time.sleep(args.sleep)
-                    rc = print_pdf(sumatra, args.asm_printer, inspection_settings, asm_pdf)
+                    rc, detail = print_pdf(sumatra, args.asm_printer, inspection_settings, asm_pdf)
                     if rc != 0:
                         failures += 1
-                        print(f"Failed Asm Inspection: {asm_pdf} (exit {rc})")
+                        print(f"Failed Asm Inspection: {asm_pdf} (exit {rc}){format_failure_detail(detail)}")
                     time.sleep(args.sleep)
             else:
                 if inspection_pages > 0 and not total_pages:
@@ -502,10 +583,10 @@ def main() -> int:
                 if args.dry_run:
                     print(f"[DRY] Asm -> {asm_pdf}")
                 else:
-                    rc = print_pdf(sumatra, args.asm_printer, asm_settings, asm_pdf)
+                    rc, detail = print_pdf(sumatra, args.asm_printer, asm_settings, asm_pdf)
                     if rc != 0:
                         failures += 1
-                        print(f"Failed Asm: {asm_pdf} (exit {rc})")
+                        print(f"Failed Asm: {asm_pdf} (exit {rc}){format_failure_detail(detail)}")
                     time.sleep(args.sleep)
 
             drawings: list[Path] = []
@@ -527,10 +608,10 @@ def main() -> int:
                     failures += 1
                     print(f"Failed Drawing hard-rotate: {dp} ({e})")
                     continue
-                rc = print_pdf(sumatra, args.drawing_printer, draw_settings, printable)
+                rc, detail = print_pdf(sumatra, args.drawing_printer, draw_settings, printable)
                 if rc != 0:
                     failures += 1
-                    print(f"Failed Drawing: {dp} (exit {rc})")
+                    print(f"Failed Drawing: {dp} (exit {rc}){format_failure_detail(detail)}")
                 time.sleep(args.sleep)
 
     if failures:
